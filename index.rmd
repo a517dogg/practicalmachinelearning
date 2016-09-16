@@ -2,21 +2,183 @@
 title: "Practical Machine Learning course project"
 author: "Adrian Martin"
 date: "September 16, 2016"
-output: html_document
+output: 
+  html_document: 
+    keep_md: yes
 ---
 
-This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
-
-When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
-
-```{r}
-summary(cars)
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, cache = TRUE)
 ```
 
-You can also embed plots, for example:
 
-```{r, echo=FALSE}
-plot(cars)
+
+```{r readdata}
+
+if(file.exists("/Users/ruthschneider/Documents/Adrian/coursera/har.RDATA")){
+    load(file = "/Users/ruthschneider/Documents/Adrian/coursera/har.RDATA", verbose = FALSE)
+} else{
+    raw.train <- read.csv(file = "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv",
+                  stringsAsFactors = FALSE)
+    raw.test <- read.csv(file = "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv",
+                 stringsAsFactors = FALSE)
+    save(list = c("raw.train", "raw.test"), 
+         file = "C:/Users/am4337/Documents/R/coursera/har.RDATA")
+}
+df <- raw.train
+
 ```
 
-Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
+## Data Exploration
+
+###### My first step will be to try to understand the data better. When I use the head() function to look at the data, I see a lot of NA values. So I want to learn how prevalent NA values are. I can use table(is.na()) and use apply() to look at all columns.
+
+```{r NAvalues}
+library(caret)
+library(MASS)
+library(plyr); library(dplyr)
+
+num.na <- function(x){return(sum(is.na(x)))}
+na.df <- dplyr::summarize_each(df, funs(num.na)) %>% t() %>% as.data.frame()
+na.df$VarName <- row.names(na.df); na.df$NumofNAs <- na.df$V1; na.df <- na.df[,2:3]; row.names(na.df) <- NULL
+cat(paste0("Number of complete cases is ", nrow(df[complete.cases(df),])))
+cat(paste0("Number of complete columns is ", nrow(dplyr::filter(na.df, NumofNAs == 0))))
+```
+
+So we have the choice of using all columns but only `r nrow(df[complete.cases(df),])` rows, or using all `r nrow(df)` rows but only `r nrow(dplyr::filter(na.df, NumofNAs == 0))` of the `r ncol(df)` columns. Of course, if only 406 out of 19622 rows are complete in the training data, probably most rows in the test data will also be incomplete. So let's drop the columns that are usually incomplete, and go from there.
+
+```{r dropcols}
+vars <- na.df$VarName[which(na.df$NumofNAs == 0)]
+df <- df[, vars]
+dim(df)
+```
+
+93 variables is still a lot. Let's look at the variables themselves and see if we can eliminate non-predictive variables. For instance, "X" is simply the row number of that observation in the dataset. That should not be used for prediction. Similarly, the timestamp variables and window variables are not based on accelerometer data.
+
+``` {r droptimestamp}
+df <- df[, !grepl(pattern = "^X$|timestamp|window", x = names(df), ignore.case = TRUE)]
+dim(df)
+```
+
+Now we're down to 87 variables. Let's look at what's left.
+
+```{r str}
+str(df)
+head(df)
+```
+
+Lots of empty character vectors! Let's pick one at random and look at it.
+
+```{r kurtosis_yaw_arm}
+head(as.data.frame(table(df$kurtosis_yaw_arm)))
+tail(as.data.frame(table(df$kurtosis_yaw_arm)))
+```
+
+It looks like the character vectors are just numeric anyways, but with lots of blanks. Let's convert them to numeric. We'll skip the first column because it is names, not character vectors of numbers. We also skip the last column, the outcome column.
+
+```{r convertchartonum}
+
+for(i in 2:ncol(df)-1){
+    if(class(df[,i]) == "character"){
+        df[i] <- as.numeric(unlist(df[i]))
+    }
+}
+
+```
+
+Converting characters to numbers will introduce NA values, so lets check again if we should drop rows or columns. How many complete columns in the data? `r ncol(df[,colSums(is.na(df)) == 0])`. How many complete cases in the data? `r nrow(df[complete.cases(df),])`. Pretty easy decision - we will drop columns.
+
+```{r dropcols2}
+df <- df[, colSums(is.na(df)) == 0]
+```
+
+## Splitting in training, validation and testing datasets
+
+###### Now that we've cleaned the data, let's split the data. Because we have so many rows of data, there is plenty of data with which to split into separate training, validation and testing datasets.
+
+```{r datasplit}
+
+set.seed(123456789)
+whichset <- sample(1:3, size = nrow(df), prob = c(.6, .2, .2), replace = TRUE)
+training <- df[whichset == 1, ]
+testing <- df[whichset == 2, ]
+validation <- df[whichset == 3, ]
+```
+
+53 variables is still a lot. Let's look for correlated variables and try to combine them.
+
+```{r preProcess}
+library(corrplot)
+M <- abs(cor(training[, sapply(df, is.numeric)]))
+diag(M) <- 0
+which(M > .98, arr.ind = TRUE)
+corrplot(M, type = "upper")
+```
+
+It looks like there are a few highly correlated predictors. Using Principle Component Analysis (PCA) pre-processing with a threshold of .98 will only drop us down 3 variables, and hopefully reducing some noise in the data. After PCA pre-processing, we can build a model.
+
+```{r GLM}
+
+tc <- trainControl(preProcOptions = list(thresh = .98))
+model.lda <- train(classe ~ ., 
+                   data = training, 
+                   method = "lda", 
+                   preProcess = "pca", 
+                   trControl = tc)
+
+testing.lda <- predict(model.lda, testing)
+confusionMatrix(testing$classe, testing.lda)
+```
+
+Wow, that level of accuracy is pretty terrible!
+
+Let's try decision-tree methods. First, a single decision tree, using the rpart2 method in caret's train.
+
+```{r rpart}
+library(rpart)
+library(rpart.plot)
+model.rpart <- train(classe ~ ., data = training, method = "rpart2", maxdepth = 10)
+rpart.plot(model.rpart$finalModel)
+confusionMatrix(testing$classe, predict(model.rpart, testing))
+```
+
+The tree barely did better than lda, but still the accuracy is not very good, especially for class C.
+
+Instead, we can go with a random forest model. Random Forest also does not require preprocessing, as it can handle co-linear variables without a problem.
+
+```{r buildmodels}
+model.rf <- train(classe ~ ., 
+                 data = training, 
+                 method = "rf", 
+                 #trControl = trainControl(method = "cv", number =3),
+                 sampsize = 1000,
+                 ntree = 100) #random forest
+library(rattle)
+
+confusionMatrix(testing$classe, predict(model.rf, testing))
+```
+
+Much better than the linear discriminant model! Let's do our final cross-validation with the validation data set.
+
+```{r validate}
+confusionMatrix(validation$classe, predict(model.rf, validation))
+```
+
+Still good accuracy! Let's get the final predictions on the quiz set of twenty observations. We'll have to clean the test data the same way we did the training, testing and validation data, and then predict.
+
+```{r predict}
+na.df <- dplyr::summarize_each(raw.test, funs(num.na)) %>% t() %>% as.data.frame()
+na.df$VarName <- row.names(na.df); na.df$NumofNAs <- na.df$V1; na.df <- na.df[,2:3]; row.names(na.df) <- NULL
+
+vars.test <- na.df$VarName[which(na.df$NumofNAs == 0)]
+test <- raw.test[, vars.test]
+test <- test[, !grepl(pattern = "^X$|timestamp|window", x = names(test), ignore.case = TRUE)]
+for(i in 2:ncol(test)-1){
+    if(class(test[,i]) == "character"){
+        test[i] <- as.numeric(unlist(test[i]))
+    }
+}
+test <- test[, colSums(is.na(test)) == 0]
+quizanswers <- predict(model.rf$finalModel, test)
+quizanswers
+```
